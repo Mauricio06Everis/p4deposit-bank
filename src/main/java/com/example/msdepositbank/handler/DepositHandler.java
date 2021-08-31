@@ -1,0 +1,258 @@
+package com.example.msdepositbank.handler;
+
+import com.example.msdepositbank.models.entities.*;
+import com.example.msdepositbank.models.entities.dto.CreateDepositWithCardDTO;
+import com.example.msdepositbank.services.BillService;
+import com.example.msdepositbank.services.DebitService;
+import com.example.msdepositbank.services.IDepositService;
+import com.example.msdepositbank.services.TransactionService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.server.ServerRequest;
+import org.springframework.web.reactive.function.server.ServerResponse;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.util.context.Context;
+import reactor.util.function.Tuple2;
+import reactor.util.function.Tuples;
+
+import java.net.URI;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import static org.springframework.http.MediaType.APPLICATION_JSON;
+
+@Component
+@Slf4j(topic = "DEPOSIT_HANDLER")
+public class DepositHandler {
+    private final IDepositService depositService;
+    private final BillService billService;
+    private final TransactionService transactionService;
+    private final DebitService debitService;
+    @Autowired
+    public DepositHandler(IDepositService depositService, BillService billService, TransactionService transactionService, DebitService debitService) {
+        this.depositService = depositService;
+        this.billService = billService;
+        this.transactionService = transactionService;
+        this.debitService = debitService;
+    }
+
+    public Mono<ServerResponse> findAll(ServerRequest request){
+        return ServerResponse.ok().contentType(MediaType.APPLICATION_JSON)
+                .body(depositService.findAll(), Deposit.class);
+    }
+
+    public Mono<ServerResponse> findById(ServerRequest request){
+        String id = request.pathVariable("id");
+        return depositService.findById(id).flatMap(deposit -> ServerResponse.ok()
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(deposit))
+                .switchIfEmpty(Mono.error(new RuntimeException("DEPOSIT DOES NOT EXIST")));
+    }
+
+    public Mono<ServerResponse> findByAccountNumber(ServerRequest request){
+        String accountNumber = request.pathVariable("accountNumber");
+        log.info("ACCOUNT_NUMBER_WEBCLIENT {}", accountNumber);
+        return billService.findByAccountNumber(accountNumber).flatMap(p -> ServerResponse.ok()
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(p))
+                .switchIfEmpty(Mono.error(new RuntimeException("THE ACCOUNT NUMBER DOES NOT EXIST")));
+    }
+
+    public Mono<ServerResponse> createDepositWithCardNumber(ServerRequest request){
+        Mono<CreateDepositWithCardDTO> createDepositWithCardDTO = request.bodyToMono(CreateDepositWithCardDTO.class);
+        Mono<Transaction> transactionMono = Mono.just(new Transaction());
+        return Mono.zip(createDepositWithCardDTO, transactionMono)
+                .zipWhen(data -> debitService.findByCardNumber(data.getT1().getCardNumber()))
+                .zipWhen(result -> {
+                    Transaction transaction = result.getT1().getT2();
+                    transaction.setTransactionType("DEPOSIT");
+                    transaction.setTransactionAmount(result.getT1().getT1().getAmount());
+                    transaction.setDescription(result.getT1().getT1().getDescription());
+                    List<Acquisition> acquisitions = result.getT2().getAssociations();
+                    Acquisition acquisition = acquisitions.stream()
+                            .filter(acq-> Objects.equals(acq.getBill().getAccountNumber(), result.getT1().getT1().getAccountNumber()))
+                            .findFirst()
+                            .orElseThrow(() -> new RuntimeException("The retire amount exceeds the available balance in yours accounts"));
+                    Bill bill = acquisition.getBill();
+                    bill.setBalance(bill.getBalance() + result.getT1().getT1().getAmount());
+                    transaction.setBill(bill);
+
+                    return transactionService.createTransaction(transaction);
+                })
+                .zipWhen(result -> {
+                    List<Acquisition> acquisitions = result.getT1().getT2().getAssociations().stream()
+                            .peek(rx -> {
+                        if (Objects.equals(rx.getBill().getAccountNumber(), result.getT2().getBill().getAccountNumber())){
+                            rx.setBill(result.getT2().getBill());
+                        }
+                    }).collect(Collectors.toList());
+                    //validate is principal
+                    Acquisition currentAcq = acquisitions.stream()
+                            .filter(acquisition -> Objects.equals(acquisition.getBill().getAccountNumber(), result.getT2().getBill().getAccountNumber()))
+                            .findFirst().orElseThrow(() -> new RuntimeException("The account does not exist in this card"));
+                    Boolean isPrincipal = result.getT1().getT2().getPrincipal().getIban().equals(currentAcq.getIban());
+                    if (Boolean.TRUE.equals(isPrincipal)){
+                        result.getT1().getT2().getPrincipal().setBill(result.getT2().getBill());
+                    }
+                    Debit debit = new Debit();
+                    debit.setAssociations(acquisitions);
+                    debit.setPrincipal(result.getT1().getT2().getPrincipal());
+                    debit.setCardNumber(result.getT1().getT2().getCardNumber());
+                    return debitService.updateDebit(debit);
+                })
+                .flatMap(response -> {
+                    CreateDepositWithCardDTO depositWithCardDTO = response.getT1().getT1().getT1().getT1();
+                    Deposit deposit = new Deposit();
+                    deposit.setAmount(depositWithCardDTO.getAmount());
+                    deposit.setDescription(depositWithCardDTO.getDescription());
+                    deposit.setBill(response.getT1().getT2().getBill());
+                    return depositService.create(deposit);
+                })
+                .flatMap(depositCreate ->
+                        ServerResponse.created(URI.create("/deposit/".concat(depositCreate.getId())))
+                                .contentType(APPLICATION_JSON)
+                                .bodyValue(depositCreate))
+                .onErrorResume(e -> Mono.error(new RuntimeException(e.getMessage())));
+    }
+
+    private Mono<Deposit> createTransactionUpdateDebitWithCard(Mono<Tuple2<CreateDepositWithCardDTO, Debit>> tuple) {
+        return tuple
+                //.zipWhen(depositRequest ->  debitService.findByAccountNumber(depositRequest.getAccountNumber()))
+                .zipWhen(data -> {
+                    data.getT1().setCardNumber(data.getT2().getCardNumber());
+                    return debitService.findByCardNumber(data.getT1().getCardNumber());
+                })
+                .zipWhen(result -> {
+            Transaction transaction = new Transaction();
+            transaction.setTransactionType("DEPOSIT");
+            transaction.setTransactionAmount(result.getT1().getT1().getAmount());
+            transaction.setDescription(result.getT1().getT1().getDescription());
+            List<Acquisition> acquisitions = result.getT2().getAssociations();
+            Acquisition acquisition = acquisitions.stream()
+                    .filter(acq-> Objects.equals(acq.getBill().getAccountNumber(), result.getT1().getT1().getAccountNumber()))
+                    .findFirst()
+                    .orElseThrow(() -> new RuntimeException("The retire amount exceeds the available balance in yours accounts"));
+            Bill bill = acquisition.getBill();
+            bill.setBalance(bill.getBalance() + result.getT1().getT1().getAmount());
+            transaction.setBill(bill);
+            return transactionService.createTransaction(transaction);
+        }).zipWhen(result -> {
+            List<Acquisition> acquisitions = result.getT1().getT2().getAssociations().stream()
+                    .peek(rx -> {
+                        if (Objects.equals(rx.getBill().getAccountNumber(), result.getT2().getBill().getAccountNumber())){
+                            rx.setBill(result.getT2().getBill());
+                        }
+                    }).collect(Collectors.toList());
+            //validate is principal
+            Acquisition currentAcq = acquisitions.stream()
+                    .filter(acquisition -> Objects.equals(acquisition.getBill().getAccountNumber(), result.getT2().getBill().getAccountNumber()))
+                    .findFirst().orElseThrow(() -> new RuntimeException("The account does not exist in this card"));
+            Boolean isPrincipal = result.getT1().getT2().getPrincipal().getIban().equals(currentAcq.getIban());
+            if (Boolean.TRUE.equals(isPrincipal)){
+                result.getT1().getT2().getPrincipal().setBill(result.getT2().getBill());
+            }
+            Debit debit = new Debit();
+            debit.setAssociations(acquisitions);
+            debit.setPrincipal(result.getT1().getT2().getPrincipal());
+            debit.setCardNumber(result.getT1().getT2().getCardNumber());
+            return debitService.updateDebit(debit);
+        }).flatMap(response -> {
+                    CreateDepositWithCardDTO depositWithCardDTO = response.getT1().getT1().getT1().getT1();
+                    Deposit deposit = new Deposit();
+                    deposit.setAmount(depositWithCardDTO.getAmount());
+                    deposit.setDescription(depositWithCardDTO.getDescription());
+                    deposit.setBill(response.getT1().getT2().getBill());
+                    return depositService.create(deposit);
+        });
+    }
+
+    private Mono<Deposit> createTransactionCardLess(Mono<CreateDepositWithCardDTO> tuple){
+        return tuple
+                .zipWhen(depositRequest ->  {
+                    log.info("ACCOUNT, {}", depositRequest.getAccountNumber());
+                    return billService.findByAccountNumber(depositRequest.getAccountNumber());
+                })
+                .zipWhen(result -> {
+                    Transaction transaction = new Transaction();
+                    transaction.setTransactionType("DEPOSIT");
+                    transaction.setTransactionAmount(result.getT1().getAmount());
+                    transaction.setDescription(result.getT1().getDescription());
+                    Bill bill = result.getT2();
+                    bill.setBalance(bill.getBalance() + result.getT1().getAmount());
+                    transaction.setBill(bill);
+                    return transactionService.createTransaction(transaction);
+                })
+                .flatMap(response -> {
+                    Deposit deposit = new Deposit();
+                    deposit.setAmount(response.getT1().getT1().getAmount());
+                    deposit.setDescription(response.getT1().getT1().getDescription());
+                    deposit.setBill(response.getT2().getBill());
+                    return depositService.create(deposit);
+                });
+    }
+
+    public Mono<ServerResponse> createDepositWithCard(ServerRequest request){
+        Mono<CreateDepositWithCardDTO> createDepositDTO = request.bodyToMono(CreateDepositWithCardDTO.class);
+
+        return createDepositDTO
+                .zipWhen(depositRequest -> {
+                    return debitService.findByAccountNumber(depositRequest.getAccountNumber())
+                            .switchIfEmpty(Mono.defer(() -> {
+                                        return Mono.just(new Debit());
+                            }));
+                })
+                .flatMap(data -> {
+                    if(data.getT2().getCardNumber() == null){
+                        return Mono.just(data.getT1()).as(this::createTransactionCardLess);
+                    }
+                    return Mono.just(Tuples.of(data.getT1(), data.getT2()))
+                            .as(this::createTransactionUpdateDebitWithCard);
+                })
+                .flatMap(depositCreate ->
+                        ServerResponse.ok()
+                                .contentType(APPLICATION_JSON)
+                                .bodyValue(depositCreate))
+                .log()
+                .onErrorResume(e -> Mono.error(new RuntimeException(e.getMessage())));
+    }
+
+    public Mono<ServerResponse> createDepositCardLess(ServerRequest request){
+        Mono<CreateDepositWithCardDTO> createDepositDTO = request.bodyToMono(CreateDepositWithCardDTO.class);
+        return createDepositDTO
+                .as(this::createTransactionCardLess)
+                .flatMap(depositCreate ->
+                        ServerResponse.created(URI.create("/deposit/".concat(depositCreate.getId())))
+                                .contentType(APPLICATION_JSON)
+                                .bodyValue(depositCreate))
+                .onErrorResume(e -> Mono.error(new RuntimeException(e.getMessage())));
+    }
+
+    /*public Mono<ServerResponse> createDepositv1(ServerRequest request){
+        Mono<Deposit> retire = request.bodyToMono(Deposit.class);
+        return retire.flatMap(depositRequest ->  billService.findByAccountNumber(depositRequest.getBill().getAccountNumber())
+                        .flatMap(billR -> {
+                            billR.setBalance(billR.getBalance() + depositRequest.getAmount());
+                            return billService.updateBill(billR);
+                        })
+                        .flatMap(bilTransaction -> {
+                            Transaction transaction = new Transaction();
+                            transaction.setTransactionType("DEPOSIT");
+                            transaction.setTransactionAmount(depositRequest.getAmount());
+                            transaction.setBill(bilTransaction);
+                            transaction.setDescription(depositRequest.getDescription());
+                            return transactionService.createTransaction(transaction);
+                        })
+                        .flatMap(currentTransaction -> {
+                            depositRequest.setBill(currentTransaction.getBill());
+                            return depositService.create(depositRequest);
+                        })).flatMap(retireUpdate -> ServerResponse.created(URI.create("/retire/".concat(retireUpdate.getId())))
+                        .contentType(APPLICATION_JSON)
+                        .bodyValue(retireUpdate))
+                .onErrorResume(e -> Mono.error(new RuntimeException("Error update deposit")));
+    }*/
+}
